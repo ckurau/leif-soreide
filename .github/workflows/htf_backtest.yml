@@ -1,14 +1,14 @@
 name: HTF Backtest
 
 on:
-  workflow_dispatch:   # Run manually from the Actions tab whenever you want
+  workflow_dispatch:
   schedule:
-    - cron: "0 6 * * 1"  # Also runs every Monday at 6am UTC (optional, remove if unwanted)
+    - cron: "0 6 * * 1"  # Every Monday 6am UTC — remove if unwanted
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 60   # Plenty of time for download + backtest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repo
@@ -20,18 +20,22 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install yfinance pandas numpy
+        run: |
+          pip install --upgrade pip
+          pip install "yfinance>=0.2.54" pandas numpy
+          echo "--- Installed versions ---"
+          pip show yfinance pandas numpy | grep -E "^(Name|Version)"
 
       - name: Run backtest
         run: python htf_backtest.py
 
-      - name: Upload results as artifacts
+      - name: Upload results
         uses: actions/upload-artifact@v4
-        if: always()   # Upload even if backtest finds 0 trades, so you can debug
+        if: always()
         with:
           name: htf-backtest-results
           path: |
             htf_trade_log.csv
             htf_equity_curve.csv
             htf_summary.txt
-          retention-days: 30   # Files stay available for 30 days
+          retention-days: 30
