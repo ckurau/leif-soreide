@@ -50,33 +50,22 @@ CONFIG = {
 }
 
 # ─────────────────────────────────────────────
-# UNIVERSE — 150 liquid stocks across sectors
+# UNIVERSE
 # ─────────────────────────────────────────────
 UNIVERSE = [
-    # Mega-cap tech
     "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AMD","AVGO","ORCL",
-    # Semiconductors
     "LRCX","KLAC","AMAT","MRVL","MPWR","ON","ACLS","ONTO","RMBS","SLAB",
-    # Software / Cloud
     "CRWD","PANW","FTNT","SNOW","DDOG","NET","ZS","ANET","NOW","WDAY",
     "INTU","ADBE","CRM","VEEV","HUBS","BILL","MDB","GTLB","ESTC","DOMO",
-    # Biotech / Pharma
     "MRNA","BNTX","LLY","NVO","REGN","VRTX","ABBV","IDXX","DXCM","PODD",
     "ISRG","EXEL","HALO","DVAX","TMDX","RGEN","ACAD","VKTX","PCVX","RXRX",
-    # Consumer / Retail
     "LULU","CELH","ELF","MNST","ORLY","DECK","ONON","CROX","WING","CAVA",
     "SFM","DUOL","MEDP","BOOT","CHWY","RH","FIVE","CVNA","DRVN","SHAK",
-    # Financials / Fintech
-    "IBKR","COIN","MARA","RIOT","HOOD","AFRM","SOFI","PYPL","SQ","UPST",
-    # Industrials / Energy
+    "IBKR","COIN","MARA","RIOT","HOOD","AFRM","SOFI","PYPL","UPST","GDOT",
     "GNRC","TDG","HEI","AXON","ODFL","SAIA","ENPH","FSLR","SEDG","PLUG",
-    # Biotech small-cap
     "IRTC","GERN","NVCR","FOLD","ARWR","IONS","KRYS","PRAX","BEAM","INVA",
-    # International ADRs
     "MELI","SE","SHOP","BABA","NIO","XPEV","LI","GRAB","DKNG","RBLX",
-    # Misc high-momentum
     "PLTR","ASTS","RKLB","LUNR","CORZ","CLSK","SMCI","HIMS","DOCS","RELY",
-    # Market filter
     "SPY",
 ]
 
@@ -93,41 +82,28 @@ def progress(current, total, label="", width=35):
         print()
 
 # ─────────────────────────────────────────────
-# YFINANCE COLUMN HANDLING
-# ─────────────────────────────────────────────
-def extract_ticker_df(raw, tk):
-    """
-    Robustly extract a single ticker's OHLCV DataFrame from yfinance output.
-
-    yfinance column layouts vary by version:
-      Old (<=0.2.x):  MultiIndex(field, ticker)  -> raw["Close"]["AAPL"]
-      New (>=0.2.40): MultiIndex(ticker, field)  -> raw["AAPL"]["Close"]
-      Single ticker:  flat columns               -> raw["Close"]
-    """
-    if not isinstance(raw.columns, pd.MultiIndex):
-        # Single-ticker flat download
-        return raw.dropna(how="all").copy()
-
-    level0 = set(raw.columns.get_level_values(0))
-    field_names = {"Close", "Open", "High", "Low", "Volume", "Adj Close"}
-
-    if field_names & level0:
-        # Old layout: (field, ticker)
-        df = raw.xs(tk, axis=1, level=1)
-    else:
-        # New layout: (ticker, field)
-        df = raw.xs(tk, axis=1, level=0)
-
-    return df.dropna(how="all").copy()
-
-
-# ─────────────────────────────────────────────
 # DATA LOADING
 # ─────────────────────────────────────────────
 def get_index(df, date):
-    """Pandas-safe integer position lookup for a date."""
     pos = df.index.searchsorted(date, side="right") - 1
-    return pos if pos >= 0 else None
+    return int(pos) if pos >= 0 else None
+
+
+def flatten_df(df):
+    """
+    Ensure the DataFrame has simple string column names: Close, Open, High, Low, Volume.
+    Handles any MultiIndex leftover after xs() slicing.
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        # Flatten: take the first level that isn't all the same value
+        df = df.copy()
+        df.columns = [
+            col[0] if col[1] == df.columns[0][1] else col[1]
+            for col in df.columns
+        ]
+    # Ensure columns are strings
+    df.columns = [str(c) for c in df.columns]
+    return df
 
 
 def load_data(tickers, start, end, batch_size=50, min_days=200):
@@ -135,7 +111,7 @@ def load_data(tickers, start, end, batch_size=50, min_days=200):
     n         = len(tickers)
     n_batches = (n + batch_size - 1) // batch_size
     failed    = 0
-    first     = True
+    first_diag = True
 
     print(f"Downloading {n} tickers in {n_batches} batches of {batch_size}...\n")
 
@@ -165,49 +141,80 @@ def load_data(tickers, start, end, batch_size=50, min_days=200):
             time.sleep(1)
             continue
 
-        # Print column diagnostics on first batch so we can debug if needed
-        if first:
-            first = False
-            print(f"\n  [diag] raw.shape        = {raw.shape}")
-            print(f"  [diag] columns type     = {type(raw.columns).__name__}")
-            print(f"  [diag] columns sample   = {list(raw.columns[:8])}")
+        is_multi = isinstance(raw.columns, pd.MultiIndex)
+
+        if first_diag:
+            first_diag = False
+            print(f"\n  [diag] raw.shape  = {raw.shape}")
+            print(f"  [diag] col type   = {'MultiIndex' if is_multi else 'flat'}")
+            print(f"  [diag] col sample = {list(raw.columns[:4])}")
 
         for tk in batch:
             try:
-                df = extract_ticker_df(raw, tk)
-                if df.empty or len(df) < min_days:
+                if not is_multi:
+                    # Single ticker download — already flat
+                    df = raw.copy()
+                else:
+                    # Detect layout by checking level 0 for field names
+                    level0_vals = set(raw.columns.get_level_values(0))
+                    field_names = {"Close", "Open", "High", "Low", "Volume"}
+                    if field_names & level0_vals:
+                        # Layout: (field, ticker) — old style
+                        df = raw.xs(tk, axis=1, level=1)
+                    else:
+                        # Layout: (ticker, field) — new style
+                        df = raw.xs(tk, axis=1, level=0)
+
+                # After xs(), columns might still be MultiIndex — flatten
+                df = flatten_df(df)
+                df = df.dropna(how="all")
+
+                # Validate required columns exist as plain strings
+                if "Close" not in df.columns or "Volume" not in df.columns:
+                    if first_diag or tk == "SPY":
+                        print(f"\n  [warn] {tk}: cols after flatten = {list(df.columns)}")
                     failed += 1
                     continue
-                if "Close" not in df.columns:
-                    print(f"\n  [warn] {tk}: no Close column — {list(df.columns)}")
-                    failed += 1
-                    continue
-                # Drop rows where Close is NaN
-                df = df[df["Close"].notna()]
+
+                # Drop rows with NaN close
+                df = df[df["Close"].notna() & df["Volume"].notna()]
+
                 if len(df) < min_days:
                     failed += 1
                     continue
+
+                # Validate Close is a plain numeric Series (not a DataFrame)
+                if isinstance(df["Close"], pd.DataFrame):
+                    print(f"\n  [warn] {tk}: Close is still a DataFrame after flatten")
+                    failed += 1
+                    continue
+
                 prices[tk] = df
+
             except Exception as e:
                 failed += 1
+                if tk == "SPY":
+                    print(f"\n  [error] SPY failed: {e}")
 
         time.sleep(0.5)
 
     print(f"\n  Loaded {len(prices)} tickers | {failed} failed/filtered")
 
-    if prices:
-        sample = list(prices.keys())[:3]
-        for tk in sample:
-            df = prices[tk]
-            print(f"  [diag] {tk}: {len(df)} rows, "
-                  f"date range {df.index[0].date()} → {df.index[-1].date()}, "
-                  f"last close={df['Close'].iloc[-1]:.2f}")
-    else:
-        print("\n  !! No data loaded. Check network access and yfinance version.")
-        print("  !! Run: pip install --upgrade yfinance")
+    # Validate SPY and a sample ticker
+    for tk in (["SPY"] + list(prices.keys())[:3]):
+        if tk not in prices:
+            print(f"  [warn] {tk} not in prices!")
+            continue
+        df  = prices[tk]
+        cls = df["Close"]
+        print(f"  [diag] {tk}: rows={len(df)}, "
+              f"Close type={type(cls).__name__}, "
+              f"Close dtype={cls.dtype}, "
+              f"last={float(cls.iloc[-1]):.2f}")
 
     print()
     return prices
+
 
 # ─────────────────────────────────────────────
 # RELATIVE STRENGTH
@@ -220,14 +227,18 @@ def calc_rs_ratings(prices, date, lookback=63):
         idx = get_index(df, date)
         if idx is None or idx < lookback:
             continue
-        p0 = float(df["Close"].iloc[idx - lookback])
-        p1 = float(df["Close"].iloc[idx])
-        if p0 > 0:
-            returns[tk] = (p1 - p0) / p0
+        try:
+            p0 = float(df["Close"].iloc[idx - lookback])
+            p1 = float(df["Close"].iloc[idx])
+            if p0 > 0 and not np.isnan(p0) and not np.isnan(p1):
+                returns[tk] = (p1 - p0) / p0
+        except Exception:
+            pass
     if not returns:
         return {}
     s = pd.Series(returns)
     return (s.rank(pct=True) * 100).to_dict()
+
 
 # ─────────────────────────────────────────────
 # MARKET FILTER
@@ -236,28 +247,37 @@ def market_is_green(spy_df, date):
     idx = get_index(spy_df, date)
     if idx is None or idx < 50:
         return False
-    sma50 = float(spy_df["Close"].iloc[idx - 50:idx].mean())
-    price = float(spy_df["Close"].iloc[idx])
-    return price > sma50
+    try:
+        sma50 = float(spy_df["Close"].iloc[idx - 50:idx].mean())
+        price = float(spy_df["Close"].iloc[idx])
+        return price > sma50
+    except Exception:
+        return False
+
 
 # ─────────────────────────────────────────────
 # HTF PATTERN DETECTION
 # ─────────────────────────────────────────────
 def find_htf_breakout(df, date_idx, cfg):
-    closes  = df["Close"].values.astype(float)
-    volumes = df["Volume"].values.astype(float)
-    n       = date_idx
+    try:
+        closes  = np.array(df["Close"].values, dtype=float)
+        volumes = np.array(df["Volume"].values, dtype=float)
+    except Exception:
+        return None
+
+    n = date_idx
 
     for flag_end in range(n, max(n - cfg["flag_max_days"] - 1, 0), -1):
         pole_high = closes[flag_end]
-        if np.isnan(pole_high):
+        if np.isnan(pole_high) or pole_high <= 0:
             continue
 
         for pole_start in range(flag_end - 1,
                                 max(flag_end - cfg["pole_max_days"] - 1, 0), -1):
             pole_low = closes[pole_start]
-            if pole_low <= 0 or np.isnan(pole_low):
+            if np.isnan(pole_low) or pole_low <= 0:
                 continue
+
             gain = (pole_high - pole_low) / pole_low
             if gain < cfg["pole_min_gain"]:
                 continue
@@ -266,24 +286,37 @@ def find_htf_breakout(df, date_idx, cfg):
             if flag_days < cfg["flag_min_days"] or flag_days > cfg["flag_max_days"]:
                 continue
 
-            seg         = closes[flag_end:n + 1]
-            seg         = seg[~np.isnan(seg)]
+            seg = closes[flag_end:n + 1]
+            seg = seg[~np.isnan(seg)]
             if len(seg) < 2:
                 continue
+
             flag_high_v = float(seg.max())
             flag_low_v  = float(seg.min())
-            drawdown    = (flag_high_v - flag_low_v) / flag_high_v
+            if flag_high_v <= 0:
+                continue
+
+            drawdown = (flag_high_v - flag_low_v) / flag_high_v
             if drawdown > cfg["flag_max_drawdown"]:
                 continue
 
-            if closes[n] <= flag_high_v:
+            today_close = closes[n]
+            if np.isnan(today_close) or today_close <= flag_high_v:
                 continue
 
             vol_slice = volumes[max(n - 20, 0):n]
-            vol_avg   = float(np.nanmean(vol_slice)) if len(vol_slice) else 0
+            vol_slice = vol_slice[~np.isnan(vol_slice)]
+            if len(vol_slice) == 0:
+                continue
+            vol_avg = float(vol_slice.mean())
             if vol_avg == 0:
                 continue
-            vol_ratio = float(volumes[n]) / vol_avg
+
+            today_vol = volumes[n]
+            if np.isnan(today_vol):
+                continue
+
+            vol_ratio = today_vol / vol_avg
             if vol_ratio < cfg["volume_ratio"]:
                 continue
 
@@ -296,7 +329,9 @@ def find_htf_breakout(df, date_idx, cfg):
                 "flag_high":     flag_high_v,
                 "vol_ratio":     round(vol_ratio, 2),
             }
+
     return None
+
 
 # ─────────────────────────────────────────────
 # BACKTEST ENGINE
@@ -313,7 +348,7 @@ def run_backtest(prices, cfg):
     n_days       = len(trading_days)
 
     if n_days == 0:
-        print("ERROR: No trading days found in date range.")
+        print("ERROR: No trading days in range.")
         return pd.DataFrame(), pd.DataFrame()
 
     print(f"Backtesting {n_days:,} trading days | {len(tickers)} stocks\n")
@@ -324,7 +359,10 @@ def run_backtest(prices, cfg):
     equity_curve   = []
     rs_cache       = {}
     green_days     = 0
-    scan_days      = 0
+
+    # Debug counters
+    dbg_rs_pass    = 0
+    dbg_pattern    = 0
 
     for day_num, date in enumerate(trading_days):
 
@@ -340,7 +378,10 @@ def run_backtest(prices, cfg):
             df = prices.get(tk)
             if df is None or date not in df.index:
                 continue
-            price       = float(df.loc[date, "Close"])
+            try:
+                price = float(df.loc[date, "Close"])
+            except Exception:
+                continue
             if np.isnan(price):
                 continue
             pos["peak"] = max(pos["peak"], price)
@@ -378,111 +419,123 @@ def run_backtest(prices, cfg):
             })
 
         # ── Entries ───────────────────────────────────────────────────
-        if len(open_positions) < cfg["max_concurrent"]:
-            if market_is_green(spy_df, date):
-                green_days += 1
-                scan_days  += 1
-                if day_num % 5 == 0:
-                    rs_cache = calc_rs_ratings(prices, date, cfg["rs_lookback"])
+        if len(open_positions) < cfg["max_concurrent"] and market_is_green(spy_df, date):
+            green_days += 1
 
-                for tk in tickers:
-                    if len(open_positions) >= cfg["max_concurrent"]:
-                        break
-                    if tk in open_positions:
-                        continue
-                    df = prices.get(tk)
-                    if df is None or date not in df.index:
-                        continue
-                    didx = get_index(df, date)
-                    if didx is None or didx < 80:
-                        continue
+            if day_num % 5 == 0:
+                rs_cache = calc_rs_ratings(prices, date, cfg["rs_lookback"])
+
+            for tk in tickers:
+                if len(open_positions) >= cfg["max_concurrent"]:
+                    break
+                if tk in open_positions:
+                    continue
+
+                df = prices.get(tk)
+                if df is None or date not in df.index:
+                    continue
+
+                didx = get_index(df, date)
+                if didx is None or didx < 80:
+                    continue
+
+                try:
                     price = float(df["Close"].iloc[didx])
-                    if np.isnan(price) or price < cfg["min_price"]:
-                        continue
-                    if rs_cache.get(tk, 0) < cfg["rs_percentile"]:
-                        continue
+                except Exception:
+                    continue
 
-                    pattern = find_htf_breakout(df, didx, cfg)
-                    if pattern is None:
-                        continue
+                if np.isnan(price) or price < cfg["min_price"]:
+                    continue
 
-                    risk_per_share = price - pattern["flag_low"]
-                    if risk_per_share <= 0:
-                        continue
-                    shares  = int((capital * cfg["risk_per_trade"]) / risk_per_share)
-                    if shares <= 0:
-                        continue
+                rs_val = rs_cache.get(tk, 0)
+                if rs_val < cfg["rs_percentile"]:
+                    continue
+
+                dbg_rs_pass += 1
+
+                pattern = find_htf_breakout(df, didx, cfg)
+                if pattern is None:
+                    continue
+
+                dbg_pattern += 1
+
+                risk_per_share = price - pattern["flag_low"]
+                if risk_per_share <= 0:
+                    continue
+
+                shares  = int((capital * cfg["risk_per_trade"]) / risk_per_share)
+                if shares <= 0:
+                    continue
+
+                pos_val = shares * price
+                if pos_val > capital * 0.25:
+                    shares  = int(capital * 0.25 / price)
                     pos_val = shares * price
-                    if pos_val > capital * 0.25:
-                        shares  = int(capital * 0.25 / price)
-                        pos_val = shares * price
-                    if pos_val > capital or shares == 0:
-                        continue
 
-                    capital -= pos_val
-                    open_positions[tk] = {
-                        "entry_date":     date,
-                        "entry_price":    price,
-                        "shares":         shares,
-                        "position_value": pos_val,
-                        "stop":           pattern["flag_low"],
-                        "peak":           price,
-                        "pole_gain":      pattern["pole_gain"],
-                        "vol_ratio":      pattern["vol_ratio"],
-                        "rs":             round(rs_cache.get(tk, 0), 1),
-                    }
+                if pos_val > capital or shares == 0:
+                    continue
+
+                capital -= pos_val
+                open_positions[tk] = {
+                    "entry_date":     date,
+                    "entry_price":    price,
+                    "shares":         shares,
+                    "position_value": pos_val,
+                    "stop":           pattern["flag_low"],
+                    "peak":           price,
+                    "pole_gain":      pattern["pole_gain"],
+                    "vol_ratio":      pattern["vol_ratio"],
+                    "rs":             round(rs_val, 1),
+                }
 
         equity_curve.append({"date": date, "equity": capital})
 
     progress(n_days, n_days,
              f"| trades={len(closed_trades)} | ${capital:,.0f}")
     print()
-    print(f"  Market green {green_days}/{n_days} days "
-          f"({green_days/n_days*100:.0f}% of backtest period)")
+    print(f"  Market green:    {green_days}/{n_days} days ({green_days/n_days*100:.0f}%)")
+    print(f"  RS filter pass:  {dbg_rs_pass} ticker-days passed RS threshold")
+    print(f"  HTF patterns:    {dbg_pattern} patterns detected")
 
     # Force-close remaining at last price
     last_date = trading_days[-1]
     for tk, pos in open_positions.items():
         df = prices.get(tk)
         if df is not None and last_date in df.index:
-            exit_price = float(df.loc[last_date, "Close"])
-            pnl = (exit_price - pos["entry_price"]) * pos["shares"]
-            ret = (exit_price - pos["entry_price"]) / pos["entry_price"]
-            closed_trades.append({
-                "ticker":      tk,
-                "entry_date":  pos["entry_date"].date(),
-                "exit_date":   last_date.date(),
-                "entry_price": round(pos["entry_price"], 2),
-                "exit_price":  round(exit_price, 2),
-                "shares":      pos["shares"],
-                "pnl":         round(pnl, 2),
-                "return_pct":  round(ret * 100, 2),
-                "days_held":   (last_date - pos["entry_date"]).days,
-                "exit_reason": "end_of_backtest",
-                "pole_gain":   pos["pole_gain"],
-                "vol_ratio":   pos["vol_ratio"],
-                "rs":          pos["rs"],
-            })
+            try:
+                exit_price = float(df.loc[last_date, "Close"])
+                pnl = (exit_price - pos["entry_price"]) * pos["shares"]
+                ret = (exit_price - pos["entry_price"]) / pos["entry_price"]
+                closed_trades.append({
+                    "ticker":      tk,
+                    "entry_date":  pos["entry_date"].date(),
+                    "exit_date":   last_date.date(),
+                    "entry_price": round(pos["entry_price"], 2),
+                    "exit_price":  round(exit_price, 2),
+                    "shares":      pos["shares"],
+                    "pnl":         round(pnl, 2),
+                    "return_pct":  round(ret * 100, 2),
+                    "days_held":   (last_date - pos["entry_date"]).days,
+                    "exit_reason": "end_of_backtest",
+                    "pole_gain":   pos["pole_gain"],
+                    "vol_ratio":   pos["vol_ratio"],
+                    "rs":          pos["rs"],
+                })
+            except Exception:
+                pass
 
     return pd.DataFrame(closed_trades), pd.DataFrame(equity_curve)
+
 
 # ─────────────────────────────────────────────
 # RESULTS
 # ─────────────────────────────────────────────
 def print_and_save_results(trades_df, equity_df, cfg):
-    # Always save files (even empty) so the workflow artifact upload works
     trades_df.to_csv("htf_trade_log.csv", index=False)
     equity_df.to_csv("htf_equity_curve.csv", index=False)
 
     if trades_df.empty:
-        msg = (
-            "\n⚠  No trades generated.\n"
-            "   The diagnostic output above should show:\n"
-            "   1. How many tickers loaded (should be 100+)\n"
-            "   2. Whether SPY loaded successfully\n"
-            "   3. What % of days the market was 'green'\n"
-            "   Share that output and we can pinpoint the issue.\n"
-        )
+        msg = "\n⚠  No trades generated. Check diagnostic output above.\n"
         print(msg)
         with open("htf_summary.txt", "w") as f:
             f.write(msg)
@@ -570,6 +623,7 @@ def print_and_save_results(trades_df, equity_df, cfg):
     print("  ✓ htf_trade_log.csv")
     print("  ✓ htf_equity_curve.csv")
     print("  ✓ htf_summary.txt")
+
 
 # ─────────────────────────────────────────────
 # MAIN
